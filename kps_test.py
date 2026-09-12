@@ -245,28 +245,110 @@ def _build_kps_envelope(token_xml: str, proof_key: bytes, saml_assign_id: str,
     )
 
 
+def _text(node, tag):
+    """First child text of `node` matching local-name `tag`, or None (also treats i:nil as None)."""
+    if node is None:
+        return None
+    matches = node.xpath(f"./*[local-name()='{tag}']")
+    if not matches:
+        return None
+    el = matches[0]
+    if el.get('{http://www.w3.org/2001/XMLSchema-instance}nil') == 'true':
+        return None
+    return (el.text or '').strip() or None
+
+
+def _format_date(parent, tag):
+    """Formats a Gun/Ay/Yil date struct under `parent/tag` as DD-MM-YYYY, or None."""
+    matches = parent.xpath(f".//*[local-name()='{tag}']")
+    if not matches:
+        return None
+    node = matches[0]
+    gun, ay, yil = _text(node, 'Gun'), _text(node, 'Ay'), _text(node, 'Yil')
+    if not (gun and ay and yil):
+        return None
+    return f'{int(gun):02d}-{int(ay):02d}-{yil}'
+
+
+def _print_kisi_bilgisi(label: str, kisi_bilgisi) -> None:
+    """Prints every field KPS returned for a single KisiBilgisi record."""
+    temel = kisi_bilgisi.xpath("./*[local-name()='TemelBilgisi']")
+    temel = temel[0] if temel else None
+    durum_bilgisi = kisi_bilgisi.xpath("./*[local-name()='DurumBilgisi']")
+    durum_bilgisi = durum_bilgisi[0] if durum_bilgisi else None
+    durum = durum_bilgisi.xpath("./*[local-name()='Durum']") if durum_bilgisi is not None else []
+    durum = durum[0] if durum else None
+
+    kimlik_no = (
+        _text(kisi_bilgisi, 'KimlikNo')
+        or _text(kisi_bilgisi, 'TCKimlikNo')
+    )
+    ad      = _text(temel, 'Ad')
+    soyad   = _text(temel, 'Soyad')
+    uyruk   = _text(temel, 'Uyruk')
+    ulke    = _text(temel, 'Ulke')
+    dogum   = _format_date(durum_bilgisi, 'DogumTarih') if durum_bilgisi is not None else None
+    olum    = _format_date(durum_bilgisi, 'OlumTarih') if durum_bilgisi is not None else None
+    durum_aciklama = _text(durum, 'Aciklama') if durum is not None else None
+    durum_kod      = _text(durum, 'Kod') if durum is not None else None
+
+    print(f'[KPS] {label}:')
+    if kimlik_no:
+        print(f'         Kimlik No     : {kimlik_no}')
+    if ad or soyad:
+        print(f'         Ad Soyad      : {ad or ""} {soyad or ""}'.rstrip())
+    if dogum:
+        print(f'         Doğum Tarihi  : {dogum}')
+    if durum_aciklama or durum_kod:
+        print(f'         Durum         : {durum_aciklama or "(bilinmiyor)"} (Kod {durum_kod or "?"})')
+    print(f'         Ölüm Tarihi   : {olum or "— (kayıtlı değil / hayatta)"}')
+    if uyruk:
+        print(f'         Uyruk         : {uyruk}')
+    if ulke:
+        print(f'         Ülke          : {ulke}')
+
+
 def _parse_kps_response(xml_str: str, tc: str) -> bool:
     root = etree.fromstring(xml_str.encode('utf-8'))
 
-    # Check top-level and child HataBilgisi (error) nodes
-    for node in root.xpath("//*[local-name()='HataBilgisi']"):
+    # Check top-level and child HataBilgisi (error) nodes, but only ones that
+    # sit outside the per-kütük KisiBilgisi blocks — those report "not found"
+    # for kütükler that legitimately don't apply (e.g. Blue Card for a citizen).
+    top_level_errors = root.xpath(
+        "//*[local-name()='SorgulaResult']/*[local-name()='HataBilgisi']"
+        " | //*[local-name()='TumKutukDogrulamaBilgileri']/*[local-name()='HataBilgisi']"
+    )
+    for node in top_level_errors:
         text = (node.text or '').strip()
         if text:
             print(f'[KPS] Error: {text}')
             return False
 
-    is_foreign = tc.startswith('99') or tc.startswith('98')
-    if is_foreign:
-        foreign_nodes = root.xpath("//*[local-name()='YabanciKisiKutukleri']")
-        if not foreign_nodes:
-            print('[KPS] No citizen record found for foreign national')
-            return False
-        nat_nodes = root.xpath(
-            "//*[local-name()='YabanciKisiKutukleri']"
-            "//*[local-name()='TemelBilgisi']/*[local-name()='Uyruk']"
-        )
-        nationality = nat_nodes[0].text if nat_nodes else '(unknown)'
-        print(f'[KPS] Foreign national record found. Nationality in KPS: {nationality}')
+    dolu = [n.text.strip() for n in root.xpath("//*[local-name()='DoluBilesenler']/*") if n.text]
+    if dolu:
+        print(f'[KPS] Dolu bileşenler (matched registry): {", ".join(dolu)}')
+
+    found_any = False
+    for label, kutuk_tag in (
+        ('TC Vatandaşı Kütüğü', 'TCVatandasiKisiKutukleri'),
+        ('Mavi Kartlı Kütüğü', 'MaviKartliKisiKutukleri'),
+        ('Yabancı Kütüğü', 'YabanciKisiKutukleri'),
+    ):
+        kutuk_nodes = root.xpath(f"//*[local-name()='{kutuk_tag}']")
+        if not kutuk_nodes:
+            continue
+        kisi_nodes = kutuk_nodes[0].xpath("./*[local-name()='KisiBilgisi']")
+        if not kisi_nodes:
+            continue
+        hata = kisi_nodes[0].xpath("./*[local-name()='HataBilgisi']")
+        if hata and _text(hata[0], 'Aciklama'):
+            continue  # "record not found" for this kütük — nothing to print
+        _print_kisi_bilgisi(label, kisi_nodes[0])
+        found_any = True
+
+    if not found_any:
+        print('[KPS] No matching record found in any registry (TC / Mavi Kart / Yabancı)')
+        return False
 
     return True
 
